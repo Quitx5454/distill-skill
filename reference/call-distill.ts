@@ -707,6 +707,17 @@ async function main() {
   const { result: refineResult } = await callAgent("refine", SAMPLE_PAYLOADS.refine, ctx);
   const durationMs = Date.now() - startedAt;
 
+  // Print the full Refine result (summary + cascade) before we distill it down
+  // into the Trace log, so the raw output is visible in the terminal.
+  console.log("\n========== Refine result ==========");
+  console.log("summary:");
+  console.log(JSON.stringify(refineResult?.summary ?? null, null, 2));
+  console.log("\ncascade:");
+  console.log(JSON.stringify(refineResult?.cascade ?? null, null, 2));
+  console.log("\nfull result:");
+  console.log(JSON.stringify(refineResult ?? null, null, 2));
+  console.log("===================================");
+
   // Pull the figures the Trace log needs straight out of the Refine response:
   //   summary.bot_ratio  +  cascade.ml_bot_count  (see distill-agent types.ts)
   const txCount = Array.isArray((SAMPLE_PAYLOADS.refine as any).data)
