@@ -1,0 +1,22 @@
+{
+  "name": "distill-x402-reference",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Runnable x402 reference client for the Distill suite (Refine/Shield/Trace)",
+  "scripts": {
+    "refine": "node --experimental-strip-types call-distill.ts refine",
+    "trace": "node --experimental-strip-types call-distill.ts trace",
+    "shield": "node --experimental-strip-types call-distill.ts shield"
+  },
+  "dependencies": {
+    "@x402/core": "^2.13.0",
+    "@x402/evm": "^2.13.0",
+    "@x402/fetch": "^2.13.0",
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.0"
+  }
+}
