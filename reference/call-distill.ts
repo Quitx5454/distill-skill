@@ -1,16 +1,13 @@
 /**
- * Distill Suite — x402 reference client
+ * Distill Refine — x402 reference client
  * ------------------------------------------------------------------
- * Demonstrates the full x402 flow against the three Distill agents:
- *   Refine  — 0.02  USDC  /entrypoints/process/invoke
- *   Trace   — 0.01  USDC  /entrypoints/trace/invoke
- *   Shield  — 0.005 USDC  /entrypoints/shield/invoke   (needs a 2nd header)
+ * Demonstrates the full x402 flow against the Refine agent:
+ *   Refine  — 0.02 USDC  /entrypoints/process/invoke
+ *            (cleans blockchain transaction data; detects bots)
  *
  * The x402 payment flow (request -> 402 -> sign -> retry) is automated by
  * `wrapFetchWithPayment` from @x402/fetch, wired to an `x402Client` carrying a
- * viem EVM signer (the exact pattern shield-agent-v2/test-live.ts uses in prod).
- * For Shield we ALSO build the EIP-712 `X-Shield-Authorization` header by hand,
- * because that header is Shield-specific and NOT part of the x402 scheme.
+ * viem EVM signer.
  *
  * Network: Base mainnet (eip155:8453). Real USDC. Gasless (EIP-3009) — the
  * signer needs USDC but no ETH.
@@ -18,41 +15,18 @@
  * Run:
  *   export WALLET_PRIVATE_KEY=0x...        # holds USDC on Base
  *   node --experimental-strip-types call-distill.ts refine
- *   node --experimental-strip-types call-distill.ts trace
- *   node --experimental-strip-types call-distill.ts shield
  *
  * Requires: Node >= 22.6 (for --experimental-strip-types), and the deps in package.json.
  */
 
-import { keccak256, toBytes, createPublicClient, http as viemHttp } from "viem";
+import { createPublicClient, http as viemHttp } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 import { toClientEvmSigner } from "@x402/evm";
 import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 
-// USDC on Base mainnet, and the Distill payTo.
-const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const PAY_TO = "0x104b5768FE505c400dd98F447665CB5c6fca388A";
 const RPC_URL = process.env.RPC_URL ?? "https://mainnet.base.org";
-
-// Shield's EIP-712 contract — MUST match shield-agent-v2/src/lib/types.ts exactly.
-const SHIELD_EIP712_DOMAIN = {
-  name: "Shield_x402_Middleware",
-  version: "2.0",
-  chainId: 8453,
-  verifyingContract: "0x0000000000000000000000000000000000000000",
-} as const;
-
-const SHIELD_EIP712_TYPES = {
-  PaymentAuthorization: [
-    { name: "amount", type: "uint256" },
-    { name: "nonce", type: "uint256" },
-    { name: "deadline", type: "uint256" },
-    { name: "payerAddress", type: "address" },
-    { name: "resourceHash", type: "bytes32" },
-  ],
-} as const;
 
 // ---------------------------------------------------------------------------
 // Agents
@@ -62,15 +36,6 @@ const AGENTS = {
   refine: {
     url: "https://distill-agent-production.up.railway.app/entrypoints/process/invoke",
     priceUsdc: "0.02",
-  },
-  trace: {
-    url: "https://trace-agent-production.up.railway.app/entrypoints/trace/invoke",
-    priceUsdc: "0.01",
-  },
-  shield: {
-    url: "https://shield-agent-v2-production.up.railway.app/entrypoints/shield/invoke",
-    priceUsdc: "0.005",
-    amountBaseUnits: 5000n, // Shield PaymentAuthorization.amount (<= 5_000_000 per-call cap)
   },
 } as const;
 
@@ -533,33 +498,10 @@ const SAMPLE_PAYLOADS: Record<AgentName, unknown> = {
       }
     ],
   },
-  trace: {
-    log: "[2026-06-17T23:14:27Z] step 1: fetch blockchain data (320ms)\\n[2026-06-17T23:14:28Z] step 2: call Refine agent via x402 (890ms)\\n[2026-06-17T23:14:29Z] step 3: bot detected at index 0, ml_score 0.926\\n[2026-06-17T23:14:30Z] done",
-    format: "auto"
-  },
-  // Shield input contract: { request: {url, description?, metadata?}, payment_requirements }.
-  shield: {
-    request: {
-      url: "https://api.example.com/query?email=john.smith@acme.com&ip=192.168.1.100",
-      description: "Analysis request from john.smith@acme.com",
-      metadata: {
-        reason: "market research",
-        contact: "+1 (555) 867-5309",
-        wallet: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-      },
-    },
-    payment_requirements: {
-      scheme: "exact",
-      network: "eip155:8453",
-      maxAmountRequired: "5000",
-      asset: USDC_BASE,
-      payTo: PAY_TO,
-    },
-  },
 };
 
 // ---------------------------------------------------------------------------
-// x402-aware fetch (mirrors shield-agent-v2/test-live.ts buildPayFetch)
+// x402-aware fetch (viem signer + @x402/fetch wrapper)
 // ---------------------------------------------------------------------------
 
 function buildPayFetch() {
@@ -581,56 +523,6 @@ function buildPayFetch() {
 }
 
 // ---------------------------------------------------------------------------
-// Shield's extra EIP-712 authorization (step 5 in SKILL.md)
-//
-// GOTCHA: the resourceHash preimage URL MUST use http:// (not https://) — Railway
-// terminates TLS so the container's c.req.url is http. Signing https:// -> 403
-// AFTER you have already paid the x402 toll.
-// ---------------------------------------------------------------------------
-
-async function buildShieldAuthHeader(
-  account: ReturnType<typeof privateKeyToAccount>,
-  endpointUrl: string,
-  body: string,
-  amount: bigint,
-): Promise<string> {
-  // Force http:// for the preimage (see gotcha above). Method is POST for invoke.
-  const serverUrl = endpointUrl.replace(/^https:\/\//, "http://");
-  const bodyHash = keccak256(toBytes(body));
-  const resourceHash = keccak256(toBytes(`${serverUrl}|POST|${bodyHash}`));
-
-  const nonce = BigInt(Date.now()); // fresh, unique (nonce-lock replay guard)
-  const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
-
-  const message = {
-    amount,
-    nonce,
-    deadline,
-    payerAddress: account.address,
-    resourceHash,
-  };
-
-  const signature = await account.signTypedData({
-    domain: SHIELD_EIP712_DOMAIN,
-    types: SHIELD_EIP712_TYPES,
-    primaryType: "PaymentAuthorization",
-    message,
-  });
-
-  // Shield decodes a base64 JSON blob; BigInts MUST be stringified before JSON.
-  return Buffer.from(
-    JSON.stringify({
-      amount: amount.toString(),
-      nonce: nonce.toString(),
-      deadline: deadline.toString(),
-      payerAddress: account.address,
-      resourceHash,
-      signature,
-    }),
-  ).toString("base64");
-}
-
-// ---------------------------------------------------------------------------
 // One paid x402 call to an agent. Returns the decoded Distill envelope + the
 // unwrapped result (response.output.output).
 // ---------------------------------------------------------------------------
@@ -644,19 +536,8 @@ async function callAgent(
   console.log(`\nAgent:  ${agentName} (${agent.priceUsdc} USDC)`);
   console.log(`URL:    ${agent.url}`);
 
-  // Serialize ONCE — the body sent and the body hashed must be byte-identical.
   const body = JSON.stringify(payload);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-
-  // Shield needs its own EIP-712 header IN ADDITION to the x402 micropayment.
-  if (agentName === "shield") {
-    headers["X-Shield-Authorization"] = await buildShieldAuthHeader(
-      ctx.account,
-      agent.url,
-      body,
-      AGENTS.shield.amountBaseUnits,
-    );
-  }
 
   // wrapFetchWithPayment automates: send -> catch 402 -> read PAYMENT-REQUIRED
   // header -> sign EIP-3009 USDC transfer -> retry with PAYMENT-SIGNATURE header.
@@ -685,27 +566,15 @@ async function callAgent(
 // ---------------------------------------------------------------------------
 // Main
 //
-// Default flow: call Refine, build a Trace log dynamically from its response,
-// then call Trace. Pass `shield` or `trace` to run that agent standalone.
+// Calls Refine with the sample transaction batch, then prints the cleaned
+// summary plus only the cascade rows flagged as bots.
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const mode = (process.argv[2] as AgentName | undefined) ?? "refine";
   const ctx = buildPayFetch();
   console.log(`Payer:  ${ctx.account.address}`);
 
-  // Standalone single-agent calls (Shield / Trace) keep working as before.
-  if (mode === "shield" || mode === "trace") {
-    const { result } = await callAgent(mode, SAMPLE_PAYLOADS[mode], ctx);
-    console.log("result:", JSON.stringify(result, null, 2));
-    return;
-  }
-
-  // ── Refine -> Trace chain ────────────────────────────────────────────────
-  const callTimestamp = new Date().toISOString();
-  const startedAt = Date.now();
   const { result: refineResult } = await callAgent("refine", SAMPLE_PAYLOADS.refine, ctx);
-  const durationMs = Date.now() - startedAt;
 
   // Print the Refine summary and only the cascade rows flagged as bots, so the
   // terminal output stays readable instead of dumping every row.
@@ -720,29 +589,6 @@ async function main() {
   console.log("\nbot rows (is_bot=true):");
   console.log(JSON.stringify(botRows, null, 2));
   console.log("===================================");
-
-  // Pull the figures the Trace log needs straight out of the Refine response:
-  //   summary.bot_ratio  +  cascade.ml_bot_count  (see distill-agent types.ts)
-  const txCount = Array.isArray((SAMPLE_PAYLOADS.refine as any).data)
-    ? (SAMPLE_PAYLOADS.refine as any).data.length
-    : 0;
-  const botRatio = refineResult?.summary?.bot_ratio ?? "n/a";
-  const mlBotCount = refineResult?.cascade?.ml_bot_count ?? "n/a";
-
-  // Build the Trace payload dynamically from what Refine returned.
-  const traceLog = [
-    `[${callTimestamp}] called Refine agent via x402 — analyzed ${txCount} transactions`,
-    `[${callTimestamp}] refine summary bot_ratio: ${botRatio}`,
-    `[${callTimestamp}] cascade ml_bot_count: ${mlBotCount}`,
-    `[${callTimestamp}] total duration ${durationMs}ms`,
-  ].join("\n");
-  const tracePayload = { log: traceLog, format: "auto" };
-
-  console.log("\n--- trace log built from Refine response ---");
-  console.log(traceLog);
-
-  const { result: traceResult } = await callAgent("trace", tracePayload, ctx);
-  console.log("result:", JSON.stringify(traceResult, null, 2));
 }
 
 main().catch((err) => {
